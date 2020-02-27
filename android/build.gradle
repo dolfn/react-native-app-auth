@@ -10,6 +10,7 @@ buildscript {
         repositories {
             google()
             jcenter()
+            maven { url 'https://jitpack.io' }
         }
         dependencies {
             classpath 'com.android.tools.build:gradle:3.5.3'
@@ -53,6 +54,6 @@ repositories {
 dependencies {
     //noinspection GradleDynamicVersion
     implementation 'com.facebook.react:react-native:+'  // From node_modules
-    implementation 'net.openid:appauth:0.7.1'
+    implementation 'com.github.MediaMonksForks:AppAuth-Android:end_session_support-SNAPSHOT'
     implementation 'androidx.browser:browser:1.2.0'
 }

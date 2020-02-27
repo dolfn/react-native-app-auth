@@ -34,9 +34,9 @@ const validateHeaders = headers => {
     return;
   }
   const customHeaderTypeErrorMessage =
-    'Config error: customHeaders type must be { token?: { [key: string]: string }, authorize?: { [key: string]: string }, register: { [key: string]: string }}';
+    'Config error: customHeaders type must be { token?: { [key: string]: string }, authorize?: { [key: string]: string }, register: { [key: string]: string }}, endSession?: { [key: string]: string }}';
 
-  const authorizedKeys = ['token', 'authorize', 'register'];
+  const authorizedKeys = ['token', 'authorize', 'register', 'endSession'];
   const keys = Object.keys(headers);
   const correctKeys = keys.filter(key => authorizedKeys.includes(key));
   invariant(
@@ -227,6 +227,46 @@ export const refresh = (
   }
 
   return RNAppAuth.refresh(...nativeMethodArguments);
+};
+
+export const endSession = (
+  {
+    issuer,
+    redirectUrl,
+    clientId,
+    clientSecret,
+    additionalParameters,
+    serviceConfiguration,
+    clientAuthMethod = 'basic',
+    dangerouslyAllowInsecureHttpRequests = false,
+    customHeaders,
+  },
+  { idToken }
+) => {
+  validateIssuerOrServiceConfigurationEndpoints(issuer, serviceConfiguration);
+  validateClientId(clientId);
+  validateRedirectUrl(redirectUrl);
+  validateHeaders(customHeaders);
+  invariant(idToken, 'Please pass in an idToken');
+  // TODO: validateAdditionalParameters
+
+  const nativeMethodArguments = [
+    issuer,
+    redirectUrl,
+    clientId,
+    clientSecret,
+    idToken,
+    additionalParameters,
+    serviceConfiguration,
+  ];
+
+  if (Platform.OS === 'android') {
+    nativeMethodArguments.push(clientAuthMethod);
+    nativeMethodArguments.push(dangerouslyAllowInsecureHttpRequests);
+    nativeMethodArguments.push(customHeaders);
+  }
+
+  return RNAppAuth.endSession(...nativeMethodArguments);
 };
 
 export const revoke = async (

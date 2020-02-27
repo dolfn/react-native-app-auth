@@ -14,6 +14,7 @@ import androidx.browser.customtabs.CustomTabsClient;
 import androidx.browser.customtabs.CustomTabsServiceConnection;
 
 import com.facebook.react.bridge.ActivityEventListener;
+import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
@@ -38,6 +39,8 @@ import net.openid.appauth.AuthorizationServiceConfiguration;
 import net.openid.appauth.ClientAuthentication;
 import net.openid.appauth.ClientSecretBasic;
 import net.openid.appauth.ClientSecretPost;
+import net.openid.appauth.EndSessionRequest;
+import net.openid.appauth.EndSessionResponse;
 import net.openid.appauth.RegistrationRequest;
 import net.openid.appauth.RegistrationResponse;
 import net.openid.appauth.ResponseTypeValues;
@@ -57,13 +60,16 @@ import java.util.concurrent.CountDownLatch;
 public class RNAppAuthModule extends ReactContextBaseJavaModule implements ActivityEventListener {
 
     public static final String CUSTOM_TAB_PACKAGE_NAME = "com.android.chrome";
+    public static final int RC_END_SESSION = 4409;
 
     private final ReactApplicationContext reactContext;
     private Promise promise;
+    private Promise endSessionPromise;
     private Boolean dangerouslyAllowInsecureHttpRequests;
     private String clientAuthMethod = "basic";
     private Map<String, String> registrationRequestHeaders = null;
     private Map<String, String> authorizationRequestHeaders = null;
+    private Map<String, String> endSessionRequestHeaders = null;
     private Map<String, String> tokenRequestHeaders = null;
     private Map<String, String> additionalParametersMap;
     private String clientSecret;
@@ -369,12 +375,106 @@ public class RNAppAuthModule extends ReactContextBaseJavaModule implements Activ
 
     }
 
+    @ReactMethod
+    public void endSession(
+            String issuer,
+            final String redirectUrl,
+            final String clientId,
+            final String clientSecret,
+            final String idToken,
+            final ReadableMap additionalParameters,
+            final ReadableMap serviceConfiguration,
+            final String clientAuthMethod,
+            final Boolean dangerouslyAllowInsecureHttpRequests,
+            final ReadableMap headers,
+            final Promise promise
+    ) {
+        this.parseHeaderMap(headers);
+        final ConnectionBuilder builder = createConnectionBuilder(dangerouslyAllowInsecureHttpRequests, this.endSessionRequestHeaders);
+        final AppAuthConfiguration appAuthConfiguration = this.createAppAuthConfiguration(builder);
+        final HashMap<String, String> additionalParametersMap = MapUtil.readableMapToHashMap(additionalParameters);
+
+        // store args in private fields for later use in onActivityResult handler
+        this.promise = promise;
+        this.dangerouslyAllowInsecureHttpRequests = dangerouslyAllowInsecureHttpRequests;
+        this.additionalParametersMap = additionalParametersMap;
+        this.clientSecret = clientSecret;
+        this.clientAuthMethod = clientAuthMethod;
+
+        // when serviceConfiguration is provided, we don't need to hit up the OpenID well-known id endpoint
+        if (serviceConfiguration != null || mServiceConfiguration.get() != null) {
+            try {
+                final AuthorizationServiceConfiguration serviceConfig = mServiceConfiguration.get() != null ? mServiceConfiguration.get() : createAuthorizationServiceConfiguration(serviceConfiguration);
+                endSessionWithConfiguration(
+                        serviceConfig,
+                        appAuthConfiguration,
+                        clientId,
+                        idToken,
+                        redirectUrl,
+                        additionalParametersMap
+                );
+            } catch (ActivityNotFoundException e) {
+                promise.reject("browser_not_found", e.getMessage());
+            } catch (Exception e) {
+                promise.reject("authentication_failed", e.getMessage());
+            }
+        } else {
+            final Uri issuerUri = Uri.parse(issuer);
+            AuthorizationServiceConfiguration.fetchFromUrl(
+                    buildConfigurationUriFromIssuer(issuerUri),
+                    new AuthorizationServiceConfiguration.RetrieveConfigurationCallback() {
+                        public void onFetchConfigurationCompleted(
+                                @Nullable AuthorizationServiceConfiguration fetchedConfiguration,
+                                @Nullable AuthorizationException ex) {
+                            if (ex != null) {
+                                promise.reject("service_configuration_fetch_error", getErrorMessage(ex));
+                                return;
+                            }
+
+                            mServiceConfiguration.set(fetchedConfiguration);
+
+                            endSessionWithConfiguration(
+                                    fetchedConfiguration,
+                                    appAuthConfiguration,
+                                    clientId,
+                                    idToken,
+                                    redirectUrl,
+                                    additionalParametersMap
+                            );
+                        }
+                    },
+                    builder
+            );
+        }
+    }
+
     /*
      * Called when the OAuth browser activity completes
      */
     @Override
     public void onActivityResult(Activity activity, int requestCode, int resultCode, Intent data) {
-        if (requestCode == 0) {
+        if (requestCode == RC_END_SESSION) {
+            if (data == null) {
+                if (promise != null) {
+                    promise.reject("end_session_error", "Data intent is null" );
+                }
+                return;
+            }
+            EndSessionResponse resp = EndSessionResponse.fromIntent(data);
+            AuthorizationException exception = AuthorizationException.fromIntent(data);
+            if (exception != null) {
+                if (promise != null) {
+                    promise.reject("end_session_error", getErrorMessage(exception));
+                }
+                return;
+            }
+
+            if (resp != null) {
+                promise.resolve(Arguments.createMap());
+            } else {
+                promise.reject("end_session_error", "End Session Response is null");
+            }
+        } else if (requestCode == 0) {
             if (data == null) {
                 if (promise != null) {
                     promise.reject("authentication_error", "Data intent is null" );
@@ -425,7 +525,6 @@ public class RNAppAuthModule extends ReactContextBaseJavaModule implements Activ
             } else {
                 authService.performTokenRequest(tokenRequest, tokenResponseCallback);
             }
-
         }
     }
 
@@ -625,6 +724,41 @@ public class RNAppAuthModule extends ReactContextBaseJavaModule implements Activ
         }
     }
 
+    /*
+     * Refresh authentication token with the provided configuration
+     */
+    private void endSessionWithConfiguration(
+            final AuthorizationServiceConfiguration serviceConfiguration,
+            final AppAuthConfiguration appAuthConfiguration,
+            final String clientId,
+            final String idToken,
+            final String endSessionRedirectUri,
+            final Map<String, String> additionalParametersMap
+    ) {
+
+        final Context context = this.reactContext;
+
+        EndSessionRequest endSessionRequest = new EndSessionRequest(
+                serviceConfiguration,
+                idToken,
+                Uri.parse(endSessionRedirectUri)
+        );
+
+        final Activity currentActivity = getCurrentActivity();
+
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+            AuthorizationService authService = new AuthorizationService(context, appAuthConfiguration);
+            Intent endSessionIntent = authService.getEndSessionRequestIntent(endSessionRequest);
+
+            currentActivity.startActivityForResult(endSessionIntent, RC_END_SESSION);
+        } else {
+            AuthorizationService authService = new AuthorizationService(currentActivity, appAuthConfiguration);
+            PendingIntent pendingIntent = currentActivity.createPendingResult(RC_END_SESSION, new Intent(), 0);
+
+            authService.performEndOfSessionRequest(endSessionRequest, pendingIntent);
+        }
+    }
+
     private void parseHeaderMap (ReadableMap headerMap) {
         if (headerMap == null) {
             return;
@@ -637,6 +771,9 @@ public class RNAppAuthModule extends ReactContextBaseJavaModule implements Activ
         }
         if (headerMap.hasKey("token") && headerMap.getType("token") == ReadableType.Map) {
             this.tokenRequestHeaders = MapUtil.readableMapToHashMap(headerMap.getMap("token"));
+        }
+        if (headerMap.hasKey("endSession") && headerMap.getType("endSession") == ReadableType.Map) {
+            this.endSessionRequestHeaders = MapUtil.readableMapToHashMap(headerMap.getMap("endSession"));
         }
 
     }
@@ -749,10 +886,15 @@ public class RNAppAuthModule extends ReactContextBaseJavaModule implements Activ
         if (serviceConfiguration.hasKey("registrationEndpoint")) {
             registrationEndpoint = Uri.parse(serviceConfiguration.getString("registrationEndpoint"));
         }
+        Uri endSessionEndpoint = null;
+        if (serviceConfiguration.hasKey("endSessionEndpoint")) {
+            endSessionEndpoint  = Uri.parse(serviceConfiguration.getString("endSessionEndpoint"));
+        }
 
         return new AuthorizationServiceConfiguration(
                 authorizationEndpoint,
                 tokenEndpoint,
+                endSessionEndpoint,
                 registrationEndpoint
         );
     }

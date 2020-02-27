@@ -7,10 +7,13 @@
 #import <React/RCTLog.h>
 #import <React/RCTConvert.h>
 #import "RNAppAuthAuthorizationFlowManager.h"
+#import "RNAppAuthInAppSafariExternalAgent.h"
 
-@interface RNAppAuth()<RNAppAuthAuthorizationFlowManagerDelegate> {
-    id<OIDExternalUserAgentSession> _currentSession;
-}
+@interface RNAppAuth()<RNAppAuthAuthorizationFlowManagerDelegate>
+
+@property (nonatomic, strong) id<OIDExternalUserAgentSession> currentSession;
+@property (nonatomic, strong) id<OIDExternalUserAgent> agent;
+
 @end
 
 @implementation RNAppAuth
@@ -172,6 +175,48 @@ RCT_REMAP_METHOD(refresh,
     }
 } // end RCT_REMAP_METHOD(refresh,
 
+RCT_REMAP_METHOD(endSession,
+                 issuer: (NSString *) issuer
+                 redirectUrl: (NSString *) redirectUrl
+                 clientId: (NSString *) clientId
+                 clientSecret: (NSString *) clientSecret
+                 idToken: (NSString *) idToken
+                 additionalParameters: (NSDictionary *_Nullable) additionalParameters
+                 serviceConfiguration: (NSDictionary *_Nullable) serviceConfiguration
+                 resolve:(RCTPromiseResolveBlock) resolve
+                 reject: (RCTPromiseRejectBlock)  reject)
+{
+    // if we have manually provided configuration, we can use it and skip the OIDC well-known discovery endpoint call
+    if (serviceConfiguration) {
+        OIDServiceConfiguration *configuration = [self createServiceConfiguration:serviceConfiguration];
+        [self endSessionWithConfiguration:configuration
+                              redirectUrl:redirectUrl
+                                 clientId:clientId
+                             clientSecret:clientSecret
+                                  idToken:idToken
+                     additionalParameters:additionalParameters
+                                  resolve:resolve
+                                   reject:reject];
+    } else {
+        // otherwise hit up the discovery endpoint
+        [OIDAuthorizationService discoverServiceConfigurationForIssuer:[NSURL URLWithString:issuer]
+                                                            completion:^(OIDServiceConfiguration *_Nullable configuration, NSError *_Nullable error) {
+                                                                if (!configuration) {
+                                                                    reject(@"service_configuration_fetch_error", [error localizedDescription], error);
+                                                                    return;
+                                                                }
+                                                                [self endSessionWithConfiguration:configuration
+                                                                         redirectUrl:redirectUrl
+                                                                            clientId:clientId
+                                                                        clientSecret:clientSecret
+                                                                             idToken:idToken
+                                                                additionalParameters:additionalParameters
+                                                                             resolve:resolve
+                                                                              reject:reject];
+                                                            }];
+    }
+} // end RCT_REMAP_METHOD(endSession,
+
 
 /*
  * Create a OIDServiceConfiguration from passed serviceConfiguration dictionary
@@ -296,21 +341,25 @@ RCT_REMAP_METHOD(refresh,
         taskId = UIBackgroundTaskInvalid;
     }];
 
+    _agent = [[RNAppAuthInAppSafariExternalAgent alloc] initWithPresentingViewController:appDelegate.window.rootViewController];
     _currentSession = [OIDAuthState authStateByPresentingAuthorizationRequest:request
-                                   presentingViewController:appDelegate.window.rootViewController
-                                                   callback:^(OIDAuthState *_Nullable authState,
-                                                              NSError *_Nullable error) {
-                                                       typeof(self) strongSelf = weakSelf;
-                                                       strongSelf->_currentSession = nil;
-                                                       [UIApplication.sharedApplication endBackgroundTask:taskId];
-                                                       taskId = UIBackgroundTaskInvalid;
-                                                       if (authState) {
-                                                           resolve([self formatResponse:authState.lastTokenResponse
-                                                               withAuthResponse:authState.lastAuthorizationResponse]);
-                                                       } else {
-                                                           reject(@"authentication_failed", [error localizedDescription], error);
-                                                       }
-                                                   }]; // end [OIDAuthState authStateByPresentingAuthorizationRequest:request
+                                                            externalUserAgent:_agent
+                                                                     callback:^(OIDAuthState * _Nullable authState, NSError * _Nullable error) {
+        typeof(self) strongSelf = weakSelf;
+        strongSelf->_currentSession = nil;
+        [UIApplication.sharedApplication endBackgroundTask:taskId];
+        taskId = UIBackgroundTaskInvalid;
+        if (authState) {
+            resolve([self formatResponse:authState.lastTokenResponse
+                        withAuthResponse:authState.lastAuthorizationResponse]);
+        } else {
+            if (error.code == -3) {
+                reject(@"authentication_cancelled", @"Cancelled authentication", error);
+            } else {
+                reject(@"authentication_failed", [error localizedDescription], error);
+            }
+        }
+    }];
 }
 
 
@@ -348,6 +397,50 @@ RCT_REMAP_METHOD(refresh,
                                                 reject(@"token_refresh_failed", [error localizedDescription], error);
                                             }
                                         }];
+}
+
+/*
+ * Ends the session with provided OIDServiceConfiguration
+ */
+- (void)endSessionWithConfiguration: (OIDServiceConfiguration *)configuration
+                        redirectUrl: (NSString *) redirectUrl
+                           clientId: (NSString *) clientId
+                       clientSecret: (NSString *) clientSecret
+                            idToken: (NSString *) idToken
+               additionalParameters: (NSDictionary *_Nullable) additionalParameters
+                            resolve:(RCTPromiseResolveBlock) resolve
+                             reject: (RCTPromiseRejectBlock)  reject {
+    OIDEndSessionRequest *endSessionRequest =
+    [[OIDEndSessionRequest alloc] initWithConfiguration:configuration
+                                            idTokenHint:idToken
+                                  postLogoutRedirectURL:[NSURL URLWithString:redirectUrl]
+                                   additionalParameters:additionalParameters];
+    UIViewController *presentedVC = RCTPresentedViewController();
+    __weak typeof(self) weakSelf = self;
+    RNAppAuthInAppSafariExternalAgent *agent
+    = [[RNAppAuthInAppSafariExternalAgent alloc] initWithPresentingViewController:presentedVC];
+    __block BOOL shouldSimulateSuccessfulLogout = NO;
+    agent.onLogoutSignInRedirection = ^{
+        shouldSimulateSuccessfulLogout = YES;
+        [weakSelf.currentSession cancel];
+    };
+    _agent = agent;
+    _currentSession = [OIDAuthorizationService presentEndSessionRequest:endSessionRequest
+                                                      externalUserAgent:_agent
+                                                               callback:^(OIDEndSessionResponse * _Nullable endSessionResponse,
+                                                                          NSError * _Nullable error) {
+        if (shouldSimulateSuccessfulLogout){
+            resolve(@{});
+        } else if (endSessionResponse) {
+            resolve([self formatEndSessionResponse:endSessionResponse]);
+        } else {
+            if (error.code == -3) {
+                reject(@"end_session_cancelled", @"Cancelled signing out", error);
+            } else {
+                reject(@"end_session_failed", [error localizedDescription], error);
+            }
+        }
+    }];
 }
 
 /*
@@ -405,6 +498,10 @@ RCT_REMAP_METHOD(refresh,
              @"registrationClientUri": response.registrationClientURI ? response.registrationClientURI : @"",
              @"tokenEndpointAuthMethod": response.tokenEndpointAuthenticationMethod ? response.tokenEndpointAuthenticationMethod : @"",
              };
+}
+
+- (NSDictionary*)formatEndSessionResponse: (OIDEndSessionResponse*) response {
+    return @{@"additionalParameters": response.additionalParameters};
 }
 
 @end
